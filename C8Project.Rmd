@@ -1,0 +1,211 @@
+---
+title: "C8Project"
+author: "Yuchao"
+date: "November 4, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Project Introduction
+
+In this project, we use the data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways, and these ways corresponded to five classes as A, B, C, D, E. The goal of this project is to **predict** the manner in which users did the exercise. 
+
+## Data Pre-processing
+
+Before any data analytics and model fitting, let's load the dataset and go over the available attributes first. Both the training and testing datasets are directly read from online source. 
+
+```{r preprocess}
+library(data.table)
+training <- fread("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+testing <- fread("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+training <- as.data.frame(training)
+testing <- as.data.frame(testing) 
+nattr <- ncol(training)
+lattr <- last(names(training))
+
+```
+
+There are totally `r nattr` columns in the data set, while the last one is _`r lattr`_, the target we're going to predict. Based on the introduction, we will use the data from accelerometer attached on the body, so we only need a subset of attributes that is relevant to accelerometer readouts and the target class. 
+
+
+```{r attr}
+ACC <- grepl('acc', names(training))
+nacc <- sum(ACC)
+ACC[2] <- TRUE
+ACC[length(ACC)] <- TRUE
+acctrain <- training[,ACC]
+acctest <- testing[,ACC]
+head(acctrain)
+naTrain <- round(sum(is.na(acctrain$var_total_accel_belt))/length(acctrain$var_total_accel_belt),4) * 100
+naTest <- round(sum(is.na(acctest$var_total_accel_belt))/length(acctest$var_total_accel_belt),4) * 100
+acctrain <- acctrain[,!grepl('var',names(acctrain))]
+acctest <- acctest[,!grepl('var',names(acctest))]
+nattr <- ncol(acctrain) - 2
+
+```
+
+It is observed that among the `r nacc` attributes relevant to accelerometer, all the attributes named following "var" contain NA value. In fact, `r naTrain`% of these attributes are NA in the training set, while `r naTest`% are NA in the testing set. Therefore, we exclude the attributes named following "var" from both the training and testing datasets. Finally, we have our dataset with `r nattr` attributes of accelerometer, one attribute for the subject and one for the target classes. 
+
+To be able to evaluate the accuracy of different models generated from the labeled dataset, we will separate the training set into two datasets without overlap, one is used for model training while the other is used for validation. The model with the best performance will be used to predict the exercise manner in the testing dataset in the end.
+
+```{r partition}
+library(ggplot2)
+library(caret)
+
+nlist = c()
+unilist = unique(acctrain$user_name)
+
+training <- data.frame(matrix(nrow = 1, ncol = NCOL(acctrain)))
+names(training) <- names(acctrain)
+valid <- data.frame(matrix(nrow = 1, ncol = NCOL(acctrain)))
+names(valid) <- names(acctrain)
+
+for (i in c(1:length(unilist))){
+  S <- acctrain[acctrain$user_name == unilist[i],]
+  nlist[i] = nrow(S)
+  intrain <- createDataPartition(y = S$classe, p = 0.75, list = FALSE)
+  sTr <- S[intrain,]
+  sTe <- S[-intrain,]
+  training <- rbind(training, sTr)
+  valid <- rbind(valid, sTe)
+}
+
+training <- training[-1,]
+valid <- valid[-1,]
+
+trSize = c()
+vaSize = c()
+
+for (i in c(1:length(unilist))){
+  S <- training[training$user_name == unilist[i],]
+  trSize[i] = nrow(S)
+  S <- valid[valid$user_name == unilist[i],]
+  vaSize[i] = nrow(S)
+}
+
+ptSize <- data.frame(Data = c(rep('Training',length(unilist)),rep('Valid',length(unilist))), Subject = rep(c(1:length(unilist)),2), Size = c(trSize,vaSize), stringsAsFactors = FALSE, row.names = NULL)
+  
+```
+
+Because the training dataset involves the data from 6 subjects, to separate it into two sets, we'd like to have a balanced partition for all the subjects. Therefore, we first create data partition with 75% training and 25% valid for each subject's subset, and then combine the data from all the subjects. The figure below shows the size of the training and valid dataset corresponding to each subject. It is worth mentioning that these two datasets are all from the original training set, and the testing set is kept untouched.
+
+```{r ptsize, echo = FALSE}
+
+ggplot(data = ptSize, aes(x = Subject, y = Size, fill = Data))+geom_bar(stat="identity", position="dodge")
+
+```
+
+## Prediction by Multi-Subject Learning
+
+With these two datasets, we first build prediction model based on **multi-subject** learning, by which means we will predict the exercise manner of each subject using the model trained by the data from not only that specific subject, but also the other subjects.
+
+Because the size of this training dataset is not trivial, Random Forest and GBM take too long time to response. We choose several light-weighted algorithm for classification, namely Decision Tree, Linear Discriminant Analysis and K Nearest Neighbor. We will validate the performance on each subject's data separately.
+
+```{r class_multi_sub}
+ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 3);
+set.seed(8844)
+
+modDT <- train(classe~., data = training[,-1], method = "rpart", trControl = ctrl);
+modLDA <- train(classe~., data = training[,-1], method = "lda", trControl = ctrl);
+modKNN <- train(classe~., data = training[,-1], method = "knn", trControl = ctrl);
+
+
+acc1 <- matrix(nrow = 3, ncol = length(unilist))
+colName <- c()
+for(s in c(1:length(unilist))){
+  colName <- c(colName,sprintf('S%d',s))
+  sub_valid <- valid[valid$user_name == unilist[s],]
+  
+  p1 <- predict(modDT, newdata = sub_valid[,-1])
+  C <- confusionMatrix(sub_valid$classe, p1)
+  acc1[1,s] <- C$overall[1]
+  
+  p2 <- predict(modLDA, newdata = sub_valid[,-1])
+  C <- confusionMatrix(sub_valid$classe, p2)
+  acc1[2,s] <- C$overall[1]
+  
+  p3 <- predict(modKNN, newdata = sub_valid[,-1])
+  C <- confusionMatrix(sub_valid$classe, p3)
+  acc1[3,s] <- C$overall[1]
+}
+
+colnames(acc1) <- colName
+row.names(acc1) <- c("DT","LDA","KNN")
+acc1
+
+```
+
+Here gives the accuracy using different methods tested on each individual's validation dataset. The figure below shows the same result. Among the three methods, KNN achieves a better result comparing with the others, which is reasonable considering different people have different exercise patterns and KNN will find the same subject's instance with small distance.
+
+```{r acc1_figure}
+acc_m <- matrix(nrow = 18, ncol = 3)
+acc_m[,1] <- rep(colName,3)
+acc_m[,2] <- c(rep("DT",6),rep("LDA",6),rep("KNN",6))
+acc_m[,3] <- c(acc1[1,],acc1[2,],acc1[3,])
+acc_m[,3] <- round(as.numeric(acc_m[,3]),2)
+colnames(acc_m) <- c("Subject","Method","Accuracy")
+ggplot(data = as.data.frame(acc_m), aes(x = Subject, y = Accuracy, fill = Method))+geom_bar(stat="identity", position="dodge")
+```
+
+## Prediction by Single-Subject Learning
+
+In this section, we train the model based on each subject separately, and apply the model to only the corresponding subject's validation dataset. Ideally, the model trained by the same person's data should work better than the model trained with multiple persons.
+
+```{r single_class}
+
+acc2 <- matrix(nrow = 3, ncol = length(unilist))
+
+for(s in c(1:length(unilist))){
+  sub_train <- training[training$user_name == unilist[s],]
+  modDT <- train(classe~., data = sub_train[,-1], method = "rpart", trControl = ctrl);
+  modLDA <- train(classe~., data =sub_train[,-1], method = "lda", trControl = ctrl);
+  modKNN <- train(classe~., data = sub_train[,-1], method = "knn", trControl = ctrl);
+  
+  sub_valid <- valid[valid$user_name == unilist[s],]
+  
+  p1 <- predict(modDT, newdata = sub_valid[,-1])
+  C <- confusionMatrix(sub_valid$classe, p1)
+  acc2[1,s] <- C$overall[1]
+  
+  p2 <- predict(modLDA, newdata = sub_valid[,-1])
+  C <- confusionMatrix(sub_valid$classe, p2)
+  acc2[2,s] <- C$overall[1]
+  
+  p3 <- predict(modKNN, newdata = sub_valid[,-1])
+  C <- confusionMatrix(sub_valid$classe, p3)
+  acc2[3,s] <- C$overall[1]
+}
+colnames(acc2) <- colName
+row.names(acc2) <- c("DT","LDA","KNN")
+acc2
+
+```
+
+The results show the increase in accuracy of all the three models by training with the specific subject's data. The figure below shows the average accuracy over all the six subjects by two types of training approach. Because the performance of KNN is the best overall, and the accuracy based on two training approaches is very close, we will predict the exercise manner in the testing set using KNN model trained by all the training data.
+
+```{r compare}
+acc_comp <- matrix(nrow = 6, ncol = 3)
+acc_comp[,1] <- rep(c("DT","LDA","KNN"),2)
+acc_comp[,2] <- c(rep("Multiple",3),rep("Single",3))
+acc_comp[1:3,3] <- rowMeans(acc1)
+acc_comp[4:6,3] <- rowMeans(acc2)
+acc_comp[,3] <- round(as.numeric(acc_comp[,3]),2)
+acc_comp[,3] <- round(as.numeric(acc_comp[,3]),2)
+acc_comp <- as.data.frame(acc_comp)
+names(acc_comp) <- c("Method","Training","Avg_Accuracy")
+ggplot(data = acc_comp, aes(x = Method, y = Avg_Accuracy, fill = Training))+geom_bar(stat="identity", position="dodge")
+```
+
+The prediction results of these 20 samples are shown as below. 
+
+```{r final}
+modKNN <- train(classe~., data = training[,-1], method = "knn", trControl = ctrl);
+predResult <- predict(modKNN, newdata = testing[,-1])
+predResult
+```
+
+
+
